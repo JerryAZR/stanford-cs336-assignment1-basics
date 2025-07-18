@@ -5,14 +5,10 @@ from collections import Counter
 from typing import BinaryIO
 
 import regex as re
+from tqdm import tqdm
 
 from cs336_basics.bpe_tokenizer import BPETokenizer
 from cs336_basics.chunk_trainer import ChunkTrainer
-
-logging.basicConfig(
-    level=logging.INFO,  # change to DEBUG for more verbosity
-    format="%(levelname)s:%(message)s",
-)
 
 logger = logging.getLogger(__name__)
 
@@ -50,7 +46,11 @@ class BPETrainer:
                 for i in range(len(chunk_boundaries) - 1)
             ]
 
-            while len(self.vocab) < self.vocab_size:
+            # Determine how many merges we need
+            initial_vocab_size = len(self.vocab)
+            num_merges_needed = self.vocab_size - initial_vocab_size
+
+            for _ in tqdm(range(num_merges_needed), desc="Training BPE"):
                 counts: Counter[tuple[bytes, bytes]] = Counter()
                 for trainer in trainers:
                     counts += trainer.count_pairs()
@@ -63,7 +63,9 @@ class BPETrainer:
                         item[0],
                     ),  # frequency first, then lex order
                 )[0]
-                logger.info(f"Merging {len(self.merges)}: {max_pair}; Counts {counts.most_common(3)}")
+                logger.info(
+                    f"Merging {len(self.merges)}: {max_pair}; Counts {counts.most_common(3)}"
+                )
                 for trainer in trainers:
                     trainer.merge_pairs(max_pair)
 
@@ -76,25 +78,27 @@ class BPETrainer:
             logger.debug("vocab:\n" + pprint.pformat(self.vocab))
             logger.debug("merges:\n" + pprint.pformat(self.merges))
 
-    def split_on_special(self, text: str) -> list[str]:
-        # Escape tokens to safely use in regex
-        escaped_tokens = [re.escape(tok.decode("utf-8")) for tok in self.special_tokens]
-        # Join into a regex OR pattern
-        pattern = f"(?:{'|'.join(escaped_tokens)})"
-        # Split without keeping the special tokens
-        return [s for s in re.split(pattern, text) if s.strip() != ""]
+    def split_on_special(self, text: bytes) -> list[bytes]:
+        # Escape tokens to safely use in regex (note: all tokens must be bytes)
+        escaped_tokens = [
+            re.escape(tok) for tok in self.special_tokens
+        ]  # tokens are already bytes
+        pattern = b"|".join(escaped_tokens)
+        # Split and filter
+        return [s for s in re.split(pattern, text) if s.strip() != b""]
 
     def create_trainer(self, start: int, end: int) -> ChunkTrainer:
-        with open(self.train_file) as f:
-            # Seek and read the chunk
+        with open(self.train_file, "rb") as f:
             f.seek(start)
-            chunk = f.read(end - start)
-            # Split into paragraphs based on special tokens
-            paragraphs = self.split_on_special(chunk)
-            # Run pre-tokenization
+            chunk = f.read(end - start)  # still bytes
+            paragraphs = self.split_on_special(chunk)  # returns list[bytes]
+            logger.debug(f"<chunk>{chunk}</chunk>")
+
             pre_tokens: Counter[bytes] = Counter()
             for paragraph in paragraphs:
-                pre_tokens += self.pre_tokenize(paragraph)
+                pre_tokens += self.pre_tokenize(
+                    paragraph.decode("utf-8")
+                )  # must also accept bytes
             return ChunkTrainer(pre_tokens)
 
     def pre_tokenize(self, text: str) -> Counter[bytes]:
@@ -154,11 +158,30 @@ def train_bpe(
 ) -> tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
     token_bytes = [token_str.encode("utf-8") for token_str in special_tokens]
     trainer = BPETrainer(input_path, vocab_size, token_bytes)
-    trainer.train(8)
-    return ({k:v for k, v in enumerate(trainer.vocab)}, trainer.merges)
+    trainer.train()
+    return ({k: v for k, v in enumerate(trainer.vocab)}, trainer.merges)
+
 
 if __name__ == "__main__":
-    from sys import argv
+    import argparse
 
-    trainer = BPETrainer(argv[1], 1000)
-    trainer.train()
+    parser = argparse.ArgumentParser(description="Train a BPE tokenizer.")
+    parser.add_argument("train_file", help="Path to the training text file.")
+    parser.add_argument("vocab_size", type=int, help="Target vocabulary size.")
+    parser.add_argument(
+        "--log",
+        default="INFO",
+        help="Logging level (DEBUG, INFO, WARNING, ERROR). Default: INFO",
+    )
+
+    args = parser.parse_args()
+
+    # Set up logging
+    log_level = getattr(logging, args.log.upper(), None)
+    if not isinstance(log_level, int):
+        raise ValueError(f"Invalid log level: {args.log}")
+    logging.basicConfig(level=log_level, format="%(levelname)s: %(message)s")
+
+    # Train
+    trainer = BPETrainer(args.train_file, args.vocab_size)
+    trainer.train(8)
